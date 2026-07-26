@@ -27,8 +27,8 @@ TypeHandle ComputeNode::_type_handle;
  * assign a shader using a ShaderAttrib.
  */
 ComputeNode::
-ComputeNode(const std::string &name) :
-  PandaNode(name),
+ComputeNode(std::string name) :
+  PandaNode(std::move(name)),
   _dispatcher(new ComputeNode::Dispatcher)
 {
   set_internal_bounds(new OmniBoundingVolume);
@@ -82,11 +82,10 @@ add_for_draw(CullTraverser *trav, CullTraverserData &data) {
   // OK, render this node.  Rendering this node means creating a
   // CullableObject for the Dispatcher.  We don't need to pass any Geoms,
   // however.
-  CullableObject *object =
-    new CullableObject(nullptr, data._state,
-                       data.get_internal_transform(trav));
-  object->set_draw_callback(_dispatcher);
-  trav->get_cull_handler()->record_object(object, trav);
+  CullableObject object(nullptr, data._state,
+                        data.get_internal_transform(trav));
+  object.set_draw_callback(_dispatcher);
+  trav->get_cull_handler()->record_object(std::move(object), trav);
 }
 
 /**
@@ -125,9 +124,8 @@ do_callback(CallbackData *cbdata) {
 
   CDReader cdata(_cycler);
 
-  Dispatches::const_iterator it;
-  for (it = cdata->_dispatches.begin(); it != cdata->_dispatches.end(); ++it) {
-    gsg->dispatch_compute(it->get_x(), it->get_y(), it->get_z());
+  for (const LVecBase3i &dispatch : cdata->_dispatches) {
+    gsg->dispatch_compute(dispatch[0], dispatch[1], dispatch[2]);
   }
 
   // No need to upcall; we don't have any geometry, after all.
@@ -194,9 +192,8 @@ void ComputeNode::Dispatcher::CData::
 write_datagram(BamWriter *manager, Datagram &dg) const {
   dg.add_uint16(_dispatches.size());
 
-  Dispatches::const_iterator it;
-  for (it = _dispatches.begin(); it != _dispatches.end(); ++it) {
-    generic_write_datagram(dg, *it);
+  for (const LVecBase3i &dispatch : _dispatches) {
+    generic_write_datagram(dg, dispatch);
   }
 }
 

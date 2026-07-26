@@ -11,34 +11,23 @@ import tempfile
 import subprocess
 import time
 import struct
-from distutils.util import get_platform
-from distutils.sysconfig import get_config_var
 from optparse import OptionParser
 from base64 import urlsafe_b64encode
 from makepandacore import LocateBinary, GetExtensionSuffix, SetVerbose, GetVerbose, GetMetadataValue, CrossCompiling, GetThirdpartyDir, SDK, GetStrip
+from locations import get_config_var
+from sysconfig import get_platform
 
 
 def get_abi_tag():
-    soabi = get_config_var('SOABI')
-    if soabi and soabi.startswith('cpython-'):
-        return 'cp' + soabi.split('-')[1]
-    elif soabi:
-        return soabi.replace('.', '_').replace('-', '_')
+    ver = 'cp%d%d' % sys.version_info[:2]
+    if hasattr(sys, 'abiflags'):
+        return ver + sys.abiflags
 
-    soabi = 'cp%d%d' % (sys.version_info[:2])
+    gil_disabled = get_config_var("Py_GIL_DISABLED")
+    if gil_disabled and int(gil_disabled):
+        return ver + 't'
 
-    if sys.version_info >= (3, 8):
-        return soabi
-
-    debug_flag = get_config_var('Py_DEBUG')
-    if (debug_flag is None and hasattr(sys, 'gettotalrefcount')) or debug_flag:
-        soabi += 'd'
-
-    malloc_flag = get_config_var('WITH_PYMALLOC')
-    if malloc_flag is None or malloc_flag:
-        soabi += 'm'
-
-    return soabi
+    return ver
 
 
 def is_exe_file(path):
@@ -99,12 +88,27 @@ MANYLINUX_LIBS = [
     # These are not mentioned in manylinux1 spec but should nonetheless always
     # be excluded.
     "linux-vdso.so.1", "linux-gate.so.1", "ld-linux.so.2", "libdrm.so.2",
+    "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1",
     "libEGL.so.1", "libOpenGL.so.0", "libGLX.so.0", "libGLdispatch.so.0",
+    "libGLESv2.so.2",
 ]
 
 # Binaries to never scan for dependencies on non-Windows systems.
 IGNORE_UNIX_DEPS_OF = [
     "panda3d_tools/pstats",
+]
+
+# Tools to exclude from the wheel.
+EXCLUDE_BINARIES = [
+    'eggcacher',
+    'packpanda',
+    'interrogate',
+    'interrogate_module',
+    'test_interrogate',
+    'parse_file',
+    'run_tests',
+    'run_pytest',
+    'run_cxx_tests',
 ]
 
 WHEEL_DATA = """Wheel-Version: 1.0
@@ -118,7 +122,7 @@ PROJECT_URLS = dict([line.split('=', 1) for line in GetMetadataValue('project_ur
 METADATA = {
     "license": GetMetadataValue('license'),
     "name": GetMetadataValue('name'),
-    "metadata_version": "2.0",
+    "metadata_version": "2.1",
     "generator": "makepanda",
     "summary": GetMetadataValue('description'),
     "extensions": {
@@ -500,7 +504,8 @@ class WheelFile(object):
                         self.consider_add_dependency(target_dep, dep_path)
                         continue
 
-                    elif dep.startswith('/Library/Frameworks/Python.framework/'):
+                    elif dep.startswith('/Library/Frameworks/Python.framework/') or \
+                         dep.startswith('/Library/Frameworks/PythonT.framework/'):
                         # Add this dependency if it's in the Python directory.
                         target_dep = os.path.dirname(target_path) + '/' + os.path.basename(dep)
                         target_dep = self.consider_add_dependency(target_dep, dep, loader_path)
@@ -563,6 +568,7 @@ class WheelFile(object):
             print("Adding {0} from {1}".format(target_path, orig_source_path))
 
         zinfo = zipfile.ZipInfo.from_file(source_path, target_path)
+        zinfo.compress_type = self.zip_file.compression
         if zinfo.date_time > self.max_date_time:
             zinfo.date_time = self.max_date_time
 
@@ -635,16 +641,26 @@ def makewheel(version, output_dir, platform=None):
         if not LocateBinary("patchelf"):
             raise Exception("patchelf is required when building a Linux wheel.")
 
-    if sys.version_info < (3, 6):
-        raise Exception("Python 3.6 or higher is required to produce a wheel.")
+    if sys.version_info < (3, 8):
+        raise Exception("Python 3.8 or higher is required to produce a wheel.")
 
     if platform is None:
         # Determine the platform from the build.
         platform_dat = os.path.join(output_dir, 'tmp', 'platform.dat')
+        cmake_cache = os.path.join(output_dir, 'CMakeCache.txt')
         if os.path.isfile(platform_dat):
+            # This is written by makepanda.
             platform = open(platform_dat, 'r').read().strip()
+        elif os.path.isfile(cmake_cache):
+            # This variable is written to the CMake cache by Package.cmake.
+            for line in open(cmake_cache, 'r').readlines():
+                if line.startswith('PYTHON_PLATFORM_TAG:STRING='):
+                    platform = line[27:].strip()
+                    break
+            if not platform:
+                raise Exception("Could not find PYTHON_PLATFORM_TAG in CMakeCache.txt, specify --platform manually.")
         else:
-            print("Could not find platform.dat in build directory")
+            print("Could not find platform.dat or CMakeCache.txt in build directory")
             platform = get_platform()
             if platform.startswith("linux-") and os.path.isdir("/opt/python"):
                 # Is this manylinux?
@@ -654,6 +670,10 @@ def makewheel(version, output_dir, platform=None):
                     platform = platform.replace("linux", "manylinux2010")
                 elif os.path.isfile("/lib/libc-2.17.so") or os.path.isfile("/lib64/libc-2.17.so"):
                     platform = platform.replace("linux", "manylinux2014")
+                elif os.path.isfile("/lib/i386-linux-gnu/libc-2.24.so") or os.path.isfile("/lib/x86_64-linux-gnu/libc-2.24.so"):
+                    platform = platform.replace("linux", "manylinux_2_24")
+                elif os.path.isfile("/lib64/libc-2.28.so") and os.path.isfile('/etc/almalinux-release'):
+                    platform = platform.replace("linux", "manylinux_2_28")
 
     platform = platform.replace('-', '_').replace('.', '_')
 
@@ -661,6 +681,7 @@ def makewheel(version, output_dir, platform=None):
         or platform.startswith('win_') \
         or platform.startswith('cygwin_')
     is_macosx = platform.startswith('macosx_')
+    is_android = platform.startswith('android_')
 
     # Global filepaths
     panda3d_dir = join(output_dir, "panda3d")
@@ -720,12 +741,20 @@ def makewheel(version, output_dir, platform=None):
         whl.ignore_deps.update(MANYLINUX_LIBS)
 
     # Add libpython for deployment.
+    suffix = ''
+    gil_disabled = get_config_var("Py_GIL_DISABLED")
+    if gil_disabled and int(gil_disabled):
+        suffix = 't'
+
     if is_windows:
-        pylib_name = 'python{0}{1}.dll'.format(*sys.version_info)
+        pylib_name = 'python{0}{1}{2}.dll'.format(sys.version_info[0], sys.version_info[1], suffix)
         pylib_path = os.path.join(get_config_var('BINDIR'), pylib_name)
     elif is_macosx:
-        pylib_name = 'libpython{0}.{1}.dylib'.format(*sys.version_info)
+        pylib_name = 'libpython{0}.{1}{2}.dylib'.format(sys.version_info[0], sys.version_info[1], suffix)
         pylib_path = os.path.join(get_config_var('LIBDIR'), pylib_name)
+    elif is_android and CrossCompiling():
+        pylib_name = 'libpython{0}.{1}{2}.so'.format(sys.version_info[0], sys.version_info[1], suffix)
+        pylib_path = os.path.join(GetThirdpartyDir(), 'python', 'lib', pylib_name)
     else:
         pylib_name = get_config_var('LDLIBRARY')
         pylib_arch = get_config_var('MULTIARCH')
@@ -784,6 +813,10 @@ if __debug__:
 
     for file in sorted(os.listdir(ext_mod_dir)):
         if file.endswith(ext_suffix):
+            if file.startswith('_tkinter.'):
+                # Tkinter is supplied in a separate wheel.
+                continue
+
             source_path = os.path.join(ext_mod_dir, file)
 
             if file.endswith('.pyd') and platform.startswith('cygwin'):
@@ -793,6 +826,21 @@ if __debug__:
                 target_path = 'deploy_libs/' + file
 
             whl.write_file(target_path, source_path)
+
+    # Include the special sysconfigdata module.
+    if os.name == 'posix':
+        import sysconfig
+
+        if hasattr(sysconfig, '_get_sysconfigdata_name'):
+            modname = sysconfig._get_sysconfigdata_name() + '.py'
+        else:
+            modname = '_sysconfigdata.py'
+
+        for entry in sys.path:
+            source_path = os.path.join(entry, modname)
+            if os.path.isfile(source_path):
+                whl.write_file('deploy_libs/' + modname, source_path)
+                break
 
     # Add plug-ins.
     for lib in PLUGIN_LIBS:
@@ -845,7 +893,7 @@ if __debug__:
     tools_init = ''
     for file in sorted(os.listdir(bin_dir)):
         basename = os.path.splitext(file)[0]
-        if basename in ('eggcacher', 'packpanda'):
+        if basename in EXCLUDE_BINARIES:
             continue
 
         source_path = os.path.join(bin_dir, file)
@@ -866,6 +914,8 @@ if __debug__:
     entry_points += '[distutils.commands]\n'
     entry_points += 'build_apps = direct.dist.commands:build_apps\n'
     entry_points += 'bdist_apps = direct.dist.commands:bdist_apps\n'
+    entry_points += '[setuptools.finalize_distribution_options]\n'
+    entry_points += 'build_apps = direct.dist._dist_hooks:finalize_distribution_options\n'
 
     whl.write_file_data('panda3d_tools/__init__.py', PANDA3D_TOOLS_INIT.format(tools_init))
 

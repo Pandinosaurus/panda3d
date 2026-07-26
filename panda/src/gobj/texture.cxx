@@ -70,6 +70,7 @@ ConfigVariableEnum<Texture::QualityLevel> texture_quality_level
           "renderers.  See Texture::set_quality_level()."));
 
 PStatCollector Texture::_texture_read_pcollector("*:Texture:Read");
+PStatCollector Texture::_texture_write_pcollector("*:Texture:Write");
 TypeHandle Texture::_type_handle;
 TypeHandle Texture::CData::_type_handle;
 AutoTextureScale Texture::_textures_power_2 = ATS_unspecified;
@@ -373,16 +374,15 @@ enum KTXCompressedFormat {
  * this is not what you want.
  */
 Texture::
-Texture(const string &name) :
-  Namable(name),
-  _lock(name),
+Texture(std::string name) :
+  Namable(std::move(name)),
+  _lock(get_name()),
   _cvar(_lock)
 {
   _reloading = false;
 
   CDWriter cdata(_cycler, true);
-  do_set_format(cdata, F_rgb);
-  do_set_component_type(cdata, T_unsigned_byte);
+  cdata->inc_properties_modified();
 }
 
 /**
@@ -809,18 +809,21 @@ estimate_texture_memory() const {
  * These data objects are not recorded to a bam or txo file.
  */
 void Texture::
-set_aux_data(const string &key, TypedReferenceCount *aux_data) {
+set_aux_data(std::string key, TypedReferenceCount *aux_data) {
   MutexHolder holder(_lock);
-  _aux_data[key] = aux_data;
+  _aux_data[std::move(key)] = aux_data;
 }
 
 /**
  * Removes a record previously recorded via set_aux_data().
  */
 void Texture::
-clear_aux_data(const string &key) {
+clear_aux_data(std::string_view key) {
   MutexHolder holder(_lock);
-  _aux_data.erase(key);
+  AuxData::iterator di = _aux_data.find(key);
+  if (di != _aux_data.end()) {
+    _aux_data.erase(di);
+  }
 }
 
 /**
@@ -828,7 +831,7 @@ clear_aux_data(const string &key) {
  * there was no record associated with the indicated key.
  */
 TypedReferenceCount *Texture::
-get_aux_data(const string &key) const {
+get_aux_data(std::string_view key) const {
   MutexHolder holder(_lock);
   AuxData::const_iterator di;
   di = _aux_data.find(key);
@@ -847,7 +850,7 @@ get_aux_data(const string &key) const {
  * Pass a real filename if it is available, or empty string if it is not.
  */
 bool Texture::
-read_txo(istream &in, const string &filename) {
+read_txo(istream &in, std::string_view filename) {
   CDWriter cdata(_cycler, true);
   cdata->inc_properties_modified();
   cdata->inc_image_modified();
@@ -862,7 +865,7 @@ read_txo(istream &in, const string &filename) {
  * Pass a real filename if it is available, or empty string if it is not.
  */
 PT(Texture) Texture::
-make_from_txo(istream &in, const string &filename) {
+make_from_txo(istream &in, std::string_view filename) {
   DatagramInputFile din;
 
   if (!din.open(in, filename)) {
@@ -930,7 +933,7 @@ make_from_txo(istream &in, const string &filename) {
  * The filename is just for reference.
  */
 bool Texture::
-write_txo(ostream &out, const string &filename) const {
+write_txo(ostream &out, std::string_view filename) const {
   CDReader cdata(_cycler);
   return do_write_txo(cdata, out, filename);
 }
@@ -945,7 +948,7 @@ write_txo(ostream &out, const string &filename) const {
  * As with read_txo, the filename is just for reference.
  */
 bool Texture::
-read_dds(istream &in, const string &filename, bool header_only) {
+read_dds(istream &in, std::string_view filename, bool header_only) {
   CDWriter cdata(_cycler, true);
   cdata->inc_properties_modified();
   cdata->inc_image_modified();
@@ -962,7 +965,7 @@ read_dds(istream &in, const string &filename, bool header_only) {
  * As with read_dds, the filename is just for reference.
  */
 bool Texture::
-read_ktx(istream &in, const string &filename, bool header_only) {
+read_ktx(istream &in, std::string_view filename, bool header_only) {
   CDWriter cdata(_cycler, true);
   cdata->inc_properties_modified();
   cdata->inc_image_modified();
@@ -1065,20 +1068,24 @@ async_ensure_ram_image(bool allow_compression, int priority) {
   double delay = async_load_delay;
 
   // This texture has not yet been queued to be reloaded.  Queue it up now.
-  task = new FunctionAsyncTask(task_name, [=](AsyncTask *task) {
+  task = chain->add([=](AsyncTask *task) {
     if (delay != 0.0) {
       Thread::sleep(delay);
     }
+
     if (allow_compression) {
-      get_ram_image();
-    } else {
-      get_uncompressed_ram_image();
+      CDWriter cdata(_cycler, unlocked_ensure_ram_image(true));
+      cdata->_reload_task = nullptr;
+      do_get_ram_image(cdata);
+    }
+    else {
+      CDWriter cdata(_cycler, false);
+      cdata->_reload_task = nullptr;
+      do_get_uncompressed_ram_image(cdata);
     }
     return AsyncTask::DS_done;
-  });
-  task->set_task_chain("texture_reload");
-  task->set_priority(priority);
-  task_mgr->add(task);
+  }, task_name, 0, priority);
+
   cdataw->_reload_task = task;
   return (AsyncFuture *)task;
 }
@@ -1090,7 +1097,7 @@ async_ensure_ram_image(bool allow_compression, int priority) {
  * support compressed image data or sub-pages; use set_ram_image() for that.
  */
 void Texture::
-set_ram_image_as(CPTA_uchar image, const string &supplied_format) {
+set_ram_image_as(CPTA_uchar image, std::string_view supplied_format) {
   CDWriter cdata(_cycler, true);
 
   string format = upcase(supplied_format);
@@ -1117,7 +1124,7 @@ set_ram_image_as(CPTA_uchar image, const string &supplied_format) {
   if (cdata->_component_width == 1) {
     if (format == "RGBA" && cdata->_num_components == 4) {
       imgsize *= 4;
-      for (int p = 0; p < imgsize; p += 4) {
+      for (size_t p = 0; p < imgsize; p += 4) {
         newdata[p + 2] = image[p    ];
         newdata[p + 1] = image[p + 1];
         newdata[p    ] = image[p + 2];
@@ -1128,7 +1135,7 @@ set_ram_image_as(CPTA_uchar image, const string &supplied_format) {
     }
     if (format == "RGB" && cdata->_num_components == 3) {
       imgsize *= 3;
-      for (int p = 0; p < imgsize; p += 3) {
+      for (size_t p = 0; p < imgsize; p += 3) {
         newdata[p + 2] = image[p    ];
         newdata[p + 1] = image[p + 1];
         newdata[p    ] = image[p + 2];
@@ -1139,13 +1146,13 @@ set_ram_image_as(CPTA_uchar image, const string &supplied_format) {
     if (format == "A" && cdata->_num_components != 3) {
       // We can generally rely on alpha to be the last component.
       int component = cdata->_num_components - 1;
-      for (int p = 0; p < imgsize; ++p) {
+      for (size_t p = 0; p < imgsize; ++p) {
         newdata[component] = image[p];
       }
       do_set_ram_image(cdata, newdata);
       return;
     }
-    for (int p = 0; p < imgsize; ++p) {
+    for (size_t p = 0; p < imgsize; ++p) {
       for (unsigned char s = 0; s < format.size(); ++s) {
         signed char component = -1;
         if (format.at(s) == 'B' || (cdata->_num_components <= 2 && format.at(s) != 'A')) {
@@ -1177,7 +1184,7 @@ set_ram_image_as(CPTA_uchar image, const string &supplied_format) {
     do_set_ram_image(cdata, newdata);
     return;
   }
-  for (int p = 0; p < imgsize; ++p) {
+  for (size_t p = 0; p < imgsize; ++p) {
     for (unsigned char s = 0; s < format.size(); ++s) {
       signed char component = -1;
       if (format.at(s) == 'B' || (cdata->_num_components <= 2 && format.at(s) != 'A')) {
@@ -1512,20 +1519,79 @@ get_image_modified_pages(UpdateSeq since, int n) const {
   if (n > 0 && cdata->_texture_type == Texture::TT_3d_texture) {
     // Don't bother handling this special case, just consider all mipmap pages
     // modified.
-    result.set_range(0, do_get_expected_mipmap_z_size(cdata, n));
+    result.set_range(0, do_get_expected_mipmap_num_pages(cdata, n));
     return result;
   }
 
+  size_t num_pages = cdata->_z_size * cdata->_num_views;
   for (const ModifiedPageRange &range : cdata->_modified_pages) {
-    if (range._z_begin >= cdata->_z_size) {
+    if (range._z_begin >= num_pages) {
       break;
     }
     if (since < range._modified) {
-      result.set_range(range._z_begin, std::min(range._z_end, (size_t)cdata->_z_size) - range._z_begin);
+      result.set_range(range._z_begin, std::min(range._z_end, num_pages) - range._z_begin);
     }
   }
 
   return result;
+}
+
+/**
+ * Like get_image_modified_pages, but returns the result for a particular view.
+ */
+SparseArray Texture::
+get_view_modified_pages(UpdateSeq since, int view, int n) const {
+  CDReader cdata(_cycler);
+
+  SparseArray result;
+  if (since == cdata->_image_modified) {
+    // Early-out since no range is more recent than _image_modified.
+    return result;
+  }
+
+  if (n > 0 && cdata->_texture_type == Texture::TT_3d_texture) {
+    // Don't bother handling this special case, just consider all mipmap pages
+    // modified.
+    result.set_range(0, do_get_expected_mipmap_z_size(cdata, n));
+    return result;
+  }
+
+  size_t offset = cdata->_z_size * view;
+  for (const ModifiedPageRange &range : cdata->_modified_pages) {
+    if (range._z_end <= offset) {
+      continue;
+    }
+    if (range._z_begin >= offset + (size_t)cdata->_z_size) {
+      break;
+    }
+    if (since < range._modified) {
+      size_t begin = std::max(range._z_begin, offset) - offset;
+      result.set_range(begin, std::min(range._z_end - offset, (size_t)cdata->_z_size) - begin);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Sets the number of buffers for asynchronous upload of texture data.  If this
+ * number is higher than 0, future texture uploads will occur in the background,
+ * up to the provided amount at a time.  The asynchronous upload will be
+ * triggered by calls to prepare() or when the texture comes into view and
+ * allow-incomplete-render is true.
+ *
+ * Each buffer is only large enough to contain a single view, so you may wish
+ * to create twice as many buffers if you want to update twice as many views.
+ *
+ * You can also pass the special value -1, which means to create as many
+ * buffers as is necessary for all asynchronous uploads to take place, and they
+ * will be deleted afterwards automatically.
+ *
+ * This setting will take effect immediately.
+ */
+void Texture::
+setup_async_transfer(int num_buffers) {
+  _num_async_transfer_buffers.store(num_buffers);
 }
 
 /**
@@ -1549,9 +1615,9 @@ prepare(PreparedGraphicsObjects *prepared_objects) {
 bool Texture::
 is_prepared(PreparedGraphicsObjects *prepared_objects) const {
   MutexHolder holder(_lock);
-  PreparedViews::const_iterator pvi;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
+  Contexts::const_iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
     return true;
   }
   return prepared_objects->is_texture_queued(this);
@@ -1565,24 +1631,11 @@ is_prepared(PreparedGraphicsObjects *prepared_objects) const {
 bool Texture::
 was_image_modified(PreparedGraphicsObjects *prepared_objects) const {
   MutexHolder holder(_lock);
-  CDReader cdata(_cycler);
-
-  PreparedViews::const_iterator pvi;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
-    const Contexts &contexts = (*pvi).second;
-    for (int view = 0; view < cdata->_num_views; ++view) {
-      Contexts::const_iterator ci;
-      ci = contexts.find(view);
-      if (ci == contexts.end()) {
-        return true;
-      }
-      TextureContext *tc = (*ci).second;
-      if (tc->was_image_modified()) {
-        return true;
-      }
-    }
-    return false;
+  Contexts::const_iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    TextureContext *tc = (*ci).second;
+    return tc->was_image_modified();
   }
   return true;
 }
@@ -1597,24 +1650,13 @@ was_image_modified(PreparedGraphicsObjects *prepared_objects) const {
 size_t Texture::
 get_data_size_bytes(PreparedGraphicsObjects *prepared_objects) const {
   MutexHolder holder(_lock);
-  CDReader cdata(_cycler);
-
-  PreparedViews::const_iterator pvi;
-  size_t total_size = 0;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
-    const Contexts &contexts = (*pvi).second;
-    for (int view = 0; view < cdata->_num_views; ++view) {
-      Contexts::const_iterator ci;
-      ci = contexts.find(view);
-      if (ci != contexts.end()) {
-        TextureContext *tc = (*ci).second;
-        total_size += tc->get_data_size_bytes();
-      }
-    }
+  Contexts::const_iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    TextureContext *tc = (*ci).second;
+    return tc->get_data_size_bytes();
   }
-
-  return total_size;
+  return 0;
 }
 
 /**
@@ -1624,24 +1666,13 @@ get_data_size_bytes(PreparedGraphicsObjects *prepared_objects) const {
 bool Texture::
 get_active(PreparedGraphicsObjects *prepared_objects) const {
   MutexHolder holder(_lock);
-  CDReader cdata(_cycler);
-
-  PreparedViews::const_iterator pvi;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
-    const Contexts &contexts = (*pvi).second;
-    for (int view = 0; view < cdata->_num_views; ++view) {
-      Contexts::const_iterator ci;
-      ci = contexts.find(view);
-      if (ci != contexts.end()) {
-        TextureContext *tc = (*ci).second;
-        if (tc->get_active()) {
-          return true;
-        }
-      }
-    }
+  Contexts::const_iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    TextureContext *tc = (*ci).second;
+    return tc->get_active();
   }
-  return false;
+  return 0;
 }
 
 /**
@@ -1651,24 +1682,13 @@ get_active(PreparedGraphicsObjects *prepared_objects) const {
 bool Texture::
 get_resident(PreparedGraphicsObjects *prepared_objects) const {
   MutexHolder holder(_lock);
-  CDReader cdata(_cycler);
-
-  PreparedViews::const_iterator pvi;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
-    const Contexts &contexts = (*pvi).second;
-    for (int view = 0; view < cdata->_num_views; ++view) {
-      Contexts::const_iterator ci;
-      ci = contexts.find(view);
-      if (ci != contexts.end()) {
-        TextureContext *tc = (*ci).second;
-        if (tc->get_resident()) {
-          return true;
-        }
-      }
-    }
+  Contexts::const_iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    TextureContext *tc = (*ci).second;
+    return tc->get_resident();
   }
-  return false;
+  return 0;
 }
 
 /**
@@ -1677,20 +1697,15 @@ get_resident(PreparedGraphicsObjects *prepared_objects) const {
  */
 bool Texture::
 release(PreparedGraphicsObjects *prepared_objects) {
-  MutexHolder holder(_lock);
-  PreparedViews::iterator pvi;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
-    Contexts temp;
-    temp.swap((*pvi).second);
-    Contexts::iterator ci;
-    for (ci = temp.begin(); ci != temp.end(); ++ci) {
-      TextureContext *tc = (*ci).second;
-      if (tc != nullptr) {
-        prepared_objects->release_texture(tc);
-      }
+  Contexts::iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    TextureContext *tc = (*ci).second;
+    if (tc != nullptr) {
+      prepared_objects->release_texture(tc);
+    } else {
+      _contexts.erase(ci);
     }
-    _prepared_views.erase(pvi);
   }
 
   // Maybe it wasn't prepared yet, but it's about to be.
@@ -1705,25 +1720,19 @@ int Texture::
 release_all() {
   MutexHolder holder(_lock);
 
-  // We have to traverse a copy of the _prepared_views list, because the
+  // We have to traverse a copy of the _contexts list, because the
   // PreparedGraphicsObjects object will call clear_prepared() in response to
   // each release_texture(), and we don't want to be modifying the
-  // _prepared_views list while we're traversing it.
-  PreparedViews temp;
-  temp.swap(_prepared_views);
-  int num_freed = (int)temp.size();
+  // _contexts list while we're traversing it.
+  Contexts temp = _contexts;
+  int num_freed = (int)_contexts.size();
 
-  PreparedViews::iterator pvi;
-  for (pvi = temp.begin(); pvi != temp.end(); ++pvi) {
-    PreparedGraphicsObjects *prepared_objects = (*pvi).first;
-    Contexts temp;
-    temp.swap((*pvi).second);
-    Contexts::iterator ci;
-    for (ci = temp.begin(); ci != temp.end(); ++ci) {
-      TextureContext *tc = (*ci).second;
-      if (tc != nullptr) {
-        prepared_objects->release_texture(tc);
-      }
+  Contexts::const_iterator ci;
+  for (ci = temp.begin(); ci != temp.end(); ++ci) {
+    PreparedGraphicsObjects *prepared_objects = (*ci).first;
+    TextureContext *tc = (*ci).second;
+    if (tc != nullptr) {
+      prepared_objects->release_texture(tc);
     }
   }
 
@@ -2084,27 +2093,29 @@ set_orig_file_size(int x, int y, int z) {
  * be rendered.
  */
 TextureContext *Texture::
-prepare_now(int view,
-            PreparedGraphicsObjects *prepared_objects,
+prepare_now(PreparedGraphicsObjects *prepared_objects,
             GraphicsStateGuardianBase *gsg) {
   MutexHolder holder(_lock);
-  CDReader cdata(_cycler);
 
-  // Don't exceed the actual number of views.
-  view = max(min(view, cdata->_num_views - 1), 0);
-
-  // Get the list of PreparedGraphicsObjects for this view.
-  Contexts &contexts = _prepared_views[prepared_objects];
-  Contexts::const_iterator pvi;
-  pvi = contexts.find(view);
-  if (pvi != contexts.end()) {
-    return (*pvi).second;
+  Contexts::const_iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    return (*ci).second;
   }
 
-  TextureContext *tc = prepared_objects->prepare_texture_now(this, view, gsg);
-  contexts[view] = tc;
+  TextureContext *tc = prepared_objects->prepare_texture_now(this, gsg);
+  _contexts[prepared_objects] = tc;
 
   return tc;
+}
+
+/**
+ * @deprecated See prepare_now() without a view parameter.
+ */
+TextureContext *Texture::
+prepare_now(int view, PreparedGraphicsObjects *prepared_objects,
+            GraphicsStateGuardianBase *gsg) {
+  return prepare_now(prepared_objects, gsg);
 }
 
 /**
@@ -2157,7 +2168,7 @@ consider_rescale(PNMImage &pnmimage) {
  * see rescale_texture().
  */
 void Texture::
-consider_rescale(PNMImage &pnmimage, const string &name, AutoTextureScale auto_texture_scale) {
+consider_rescale(PNMImage &pnmimage, std::string_view name, AutoTextureScale auto_texture_scale) {
   int new_x_size = pnmimage.get_x_size();
   int new_y_size = pnmimage.get_y_size();
   if (adjust_size(new_x_size, new_y_size, name, false, auto_texture_scale)) {
@@ -2206,7 +2217,7 @@ format_texture_type(TextureType tt) {
  * Returns the TextureType corresponding to the indicated string word.
  */
 Texture::TextureType Texture::
-string_texture_type(const string &str) {
+string_texture_type(std::string_view str) {
   if (cmp_nocase(str, "1d_texture") == 0) {
     return TT_1d_texture;
   } else if (cmp_nocase(str, "2d_texture") == 0) {
@@ -2261,7 +2272,7 @@ format_component_type(ComponentType ct) {
  * Returns the ComponentType corresponding to the indicated string word.
  */
 Texture::ComponentType Texture::
-string_component_type(const string &str) {
+string_component_type(std::string_view str) {
   if (cmp_nocase(str, "unsigned_byte") == 0) {
     return T_unsigned_byte;
   } else if (cmp_nocase(str, "unsigned_short") == 0) {
@@ -2405,7 +2416,7 @@ format_format(Format format) {
  * Returns the Format corresponding to the indicated string word.
  */
 Texture::Format Texture::
-string_format(const string &str) {
+string_format(std::string_view str) {
   if (cmp_nocase(str, "depth_stencil") == 0) {
     return F_depth_stencil;
   } else if (cmp_nocase(str, "depth_component") == 0) {
@@ -2565,7 +2576,7 @@ format_compression_mode(CompressionMode cm) {
  * representation.
  */
 Texture::CompressionMode Texture::
-string_compression_mode(const string &str) {
+string_compression_mode(std::string_view str) {
   if (cmp_nocase_uh(str, "default") == 0) {
     return CM_default;
   } else if (cmp_nocase_uh(str, "off") == 0) {
@@ -2628,7 +2639,7 @@ format_quality_level(QualityLevel ql) {
  * representation.
  */
 Texture::QualityLevel Texture::
-string_quality_level(const string &str) {
+string_quality_level(std::string_view str) {
   if (cmp_nocase(str, "default") == 0) {
     return QL_default;
   } else if (cmp_nocase(str, "fastest") == 0) {
@@ -2829,7 +2840,7 @@ is_integer(Format format) {
  * false if it is the same.
  */
 bool Texture::
-adjust_size(int &x_size, int &y_size, const string &name,
+adjust_size(int &x_size, int &y_size, std::string_view name,
             bool for_padding, AutoTextureScale auto_texture_scale) {
   bool exclude = false;
   int num_excludes = exclude_texture_scale.get_num_unique_values();
@@ -2957,7 +2968,7 @@ reconsider_dirty() {
  * power-2.
  */
 bool Texture::
-do_adjust_this_size(const CData *cdata, int &x_size, int &y_size, const string &name,
+do_adjust_this_size(const CData *cdata, int &x_size, int &y_size, std::string_view name,
                     bool for_padding) const {
   return adjust_size(x_size, y_size, name, for_padding, cdata->_auto_texture_scale);
 }
@@ -3490,7 +3501,7 @@ do_read_one(CData *cdata, const Filename &fullpath, const Filename &alpha_fullpa
  * Internal method to load a single page or mipmap level.
  */
 bool Texture::
-do_load_one(CData *cdata, const PNMImage &pnmimage, const string &name, int z, int n,
+do_load_one(CData *cdata, const PNMImage &pnmimage, std::string_view name, int z, int n,
             const LoaderOptions &options) {
   if (cdata->_ram_images.size() <= 1 && n == 0) {
     // A special case for mipmap level 0.  When we load mipmap level 0, unless
@@ -3564,7 +3575,7 @@ do_load_one(CData *cdata, const PNMImage &pnmimage, const string &name, int z, i
  * Internal method to load a single page or mipmap level.
  */
 bool Texture::
-do_load_one(CData *cdata, const PfmFile &pfm, const string &name, int z, int n,
+do_load_one(CData *cdata, const PfmFile &pfm, std::string_view name, int z, int n,
             const LoaderOptions &options) {
   if (cdata->_ram_images.size() <= 1 && n == 0) {
     // A special case for mipmap level 0.  When we load mipmap level 0, unless
@@ -3680,6 +3691,12 @@ do_read_txo_file(CData *cdata, const Filename &fullpath) {
   }
 
   istream *in = file->open_read_file(true);
+  if (in == nullptr) {
+    gobj_cat.error()
+      << "Failed to open " << filename << " for reading.\n";
+    return false;
+  }
+
   bool success = do_read_txo(cdata, *in, fullpath);
   vfs->close_read_file(in);
 
@@ -3694,7 +3711,7 @@ do_read_txo_file(CData *cdata, const Filename &fullpath) {
  *
  */
 bool Texture::
-do_read_txo(CData *cdata, istream &in, const string &filename) {
+do_read_txo(CData *cdata, istream &in, std::string_view filename) {
   PT(Texture) other = make_from_txo(in, filename);
   if (other == nullptr) {
     return false;
@@ -3735,6 +3752,12 @@ do_read_dds_file(CData *cdata, const Filename &fullpath, bool header_only) {
   }
 
   istream *in = file->open_read_file(true);
+  if (in == nullptr) {
+    gobj_cat.error()
+      << "Failed to open " << filename << " for reading.\n";
+    return false;
+  }
+
   bool success = do_read_dds(cdata, *in, fullpath, header_only);
   vfs->close_read_file(in);
 
@@ -3753,7 +3776,7 @@ do_read_dds_file(CData *cdata, const Filename &fullpath, bool header_only) {
  *
  */
 bool Texture::
-do_read_dds(CData *cdata, istream &in, const string &filename, bool header_only) {
+do_read_dds(CData *cdata, istream &in, std::string_view filename, bool header_only) {
   StreamReader dds(in);
 
   // DDS header (19 words)
@@ -4415,6 +4438,12 @@ do_read_ktx_file(CData *cdata, const Filename &fullpath, bool header_only) {
   }
 
   istream *in = file->open_read_file(true);
+  if (in == nullptr) {
+    gobj_cat.error()
+      << "Failed to open " << filename << " for reading.\n";
+    return false;
+  }
+
   bool success = do_read_ktx(cdata, *in, fullpath, header_only);
   vfs->close_read_file(in);
 
@@ -4433,7 +4462,7 @@ do_read_ktx_file(CData *cdata, const Filename &fullpath, bool header_only) {
  *
  */
 bool Texture::
-do_read_ktx(CData *cdata, istream &in, const string &filename, bool header_only) {
+do_read_ktx(CData *cdata, istream &in, std::string_view filename, bool header_only) {
   StreamReader ktx(in);
 
   unsigned char magic[12];
@@ -5177,6 +5206,8 @@ do_read_ktx(CData *cdata, istream &in, const string &filename, bool header_only)
 bool Texture::
 do_write(CData *cdata,
          const Filename &fullpath, int z, int n, bool write_pages, bool write_mipmaps) {
+  PStatTimer timer(_texture_write_pcollector);
+
   if (is_txo_filename(fullpath)) {
     if (!do_has_bam_rawdata(cdata)) {
       do_get_bam_rawdata(cdata);
@@ -5408,7 +5439,7 @@ do_write_txo_file(const CData *cdata, const Filename &fullpath) const {
  *
  */
 bool Texture::
-do_write_txo(const CData *cdata, ostream &out, const string &filename) const {
+do_write_txo(const CData *cdata, ostream &out, std::string_view filename) const {
   DatagramOutputFile dout;
 
   if (!dout.open(out, filename)) {
@@ -5697,7 +5728,14 @@ do_modify_ram_image(CData *cdata) {
   } else {
     do_clear_ram_mipmap_images(cdata);
   }
-  return cdata->_ram_images[0]._image;
+  PTA_uchar data = cdata->_ram_images[0]._image;
+  if (data.get_node_ref_count() > 0) {
+    // Copy on write, if an upload thread is reading this now.
+    PTA_uchar new_data = PTA_uchar::empty_array(0);
+    new_data.v() = data.v();
+    data.swap(new_data);
+  }
+  return data;
 }
 
 /**
@@ -5772,7 +5810,15 @@ do_modify_ram_mipmap_image(CData *cdata, int n) {
       cdata->_ram_images[n]._image.empty()) {
     do_make_ram_mipmap_image(cdata, n);
   }
-  return cdata->_ram_images[n]._image;
+
+  PTA_uchar data = cdata->_ram_images[n]._image;
+  if (data.get_node_ref_count() > 0) {
+    // Copy on write, if an upload thread is reading this now.
+    PTA_uchar new_data = PTA_uchar::empty_array(0);
+    new_data.v() = data.v();
+    data.swap(new_data);
+  }
+  return data;
 }
 
 /**
@@ -5892,7 +5938,7 @@ do_get_clear_data(const CData *cdata, unsigned char *into) const {
     nassertr(num_components == 1, 0);
     *((unsigned int *)into) =
       ((unsigned int)(clear_value[0] * 16777215) << 8) +
-       (unsigned int)max(min(clear_value[1], (PN_stdfloat)255), (PN_stdfloat)0);
+       (unsigned int)std::clamp(clear_value[1], (PN_stdfloat)0, (PN_stdfloat)255);
     break;
 
   case T_int:
@@ -5932,7 +5978,7 @@ do_get_clear_data(const CData *cdata, unsigned char *into) const {
       v.uf = clear_value[i];
       uint16_t sign = ((v.ui & 0x80000000u) >> 16u);
       uint32_t mantissa = (v.ui & 0x007fffffu);
-      uint16_t exponent = (uint16_t)std::min(std::max((int)((v.ui & 0x7f800000u) >> 23u) - 112, 0), 31);
+      uint16_t exponent = (uint16_t)std::clamp((int)((v.ui & 0x7f800000u) >> 23u) - 112, 0, 31);
       mantissa += (mantissa & 0x00001000u) << 1u;
       ((uint16_t *)into)[i] = (uint16_t)(sign | ((exponent << 10u) | (mantissa >> 13u)));
     }
@@ -6081,14 +6127,6 @@ do_compress_ram_image(CData *cdata, Texture::CompressionMode compression,
     }
   }
 
-  // Choose an appropriate quality level.
-  if (quality_level == Texture::QL_default) {
-    quality_level = cdata->_quality_level;
-  }
-  if (quality_level == Texture::QL_default) {
-    quality_level = texture_quality_level;
-  }
-
   if (compression == CM_rgtc) {
     // We should compress RGTC ourselves, as squish does not support it.
     if (cdata->_component_type != T_unsigned_byte) {
@@ -6161,6 +6199,14 @@ do_compress_ram_image(CData *cdata, Texture::CompressionMode compression,
   }
 
 #ifdef HAVE_SQUISH
+  // Choose an appropriate quality level.
+  if (quality_level == Texture::QL_default) {
+    quality_level = cdata->_quality_level;
+  }
+  if (quality_level == Texture::QL_default) {
+    quality_level = texture_quality_level;
+  }
+
   if (cdata->_texture_type != TT_3d_texture &&
       cdata->_texture_type != TT_2d_texture_array &&
       cdata->_component_type == T_unsigned_byte) {
@@ -7484,7 +7530,7 @@ do_get_uncompressed_ram_image(CData *cdata) {
  * will return NULL.
  */
 CPTA_uchar Texture::
-get_ram_image_as(const string &requested_format) {
+get_ram_image_as(std::string_view requested_format) {
   CDWriter cdata(_cycler, false);
   string format = upcase(requested_format);
 
@@ -7494,7 +7540,8 @@ get_ram_image_as(const string &requested_format) {
     gobj_cat.error() << "Couldn't find an uncompressed RAM image!\n";
     return CPTA_uchar(get_class_type());
   }
-  int imgsize = cdata->_x_size * cdata->_y_size;
+  size_t imgsize = (size_t)cdata->_x_size * (size_t)cdata->_y_size *
+                   (size_t)cdata->_z_size * (size_t)cdata->_num_views;
   nassertr(cdata->_num_components > 0 && cdata->_num_components <= 4, CPTA_uchar(get_class_type()));
   nassertr(data.size() == (size_t)(cdata->_component_width * cdata->_num_components * imgsize), CPTA_uchar(get_class_type()));
 
@@ -7532,7 +7579,7 @@ get_ram_image_as(const string &requested_format) {
       const uint32_t *src = (const uint32_t *)data.p();
       uint32_t *dst = (uint32_t *)newdata.p();
 
-      for (int p = 0; p < imgsize; ++p) {
+      for (size_t p = 0; p < imgsize; ++p) {
         uint32_t v = *src++;
         *dst++ = ((v & 0xff00ff00u)) |
                  ((v & 0x00ff0000u) >> 16) |
@@ -7569,7 +7616,7 @@ get_ram_image_as(const string &requested_format) {
       // If the image size wasn't a multiple of 4, we may have a handful of
       // pixels left over.  Convert those the slower way.
       uint8_t *tail = (uint8_t *)dst;
-      for (int i = (imgsize & ~0x3); i < imgsize; ++i) {
+      for (size_t i = (imgsize & ~0x3); i < imgsize; ++i) {
         uint32_t v = *src++;
         *tail++ = (v & 0x00ff0000u) >> 16;
         *tail++ = (v & 0x0000ff00u) >> 8;
@@ -7583,8 +7630,8 @@ get_ram_image_as(const string &requested_format) {
 
       // Convert blocks of 4 pixels at a time, so that we can treat both the
       // source and destination as 32-bit integers.
-      int blocks = imgsize >> 2;
-      for (int i = 0; i < blocks; ++i) {
+      size_t blocks = imgsize >> 2;
+      for (size_t i = 0; i < blocks; ++i) {
         uint32_t v0 = *src++;
         uint32_t v1 = *src++;
         uint32_t v2 = *src++;
@@ -7597,7 +7644,7 @@ get_ram_image_as(const string &requested_format) {
       // If the image size wasn't a multiple of 4, we may have a handful of
       // pixels left over.  Convert those the slower way.
       uint8_t *tail = (uint8_t *)dst;
-      for (int i = (imgsize & ~0x3); i < imgsize; ++i) {
+      for (size_t i = (imgsize & ~0x3); i < imgsize; ++i) {
         uint32_t v = *src++;
         *tail++ = (v & 0x000000ffu);
         *tail++ = (v & 0x0000ff00u) >> 8;
@@ -7609,7 +7656,7 @@ get_ram_image_as(const string &requested_format) {
     uint8_t *dst = (uint8_t *)newdata.p();
 
     if (format == "RGB" && cdata->_num_components == 3) {
-      for (int i = 0; i < imgsize; ++i) {
+      for (size_t i = 0; i < imgsize; ++i) {
         *dst++ = src[2];
         *dst++ = src[1];
         *dst++ = src[0];
@@ -7619,14 +7666,14 @@ get_ram_image_as(const string &requested_format) {
     }
     if (format == "A" && cdata->_num_components != 3) {
       // We can generally rely on alpha to be the last component.
-      for (int p = 0; p < imgsize; ++p) {
+      for (size_t p = 0; p < imgsize; ++p) {
         dst[p] = src[alpha];
         src += cdata->_num_components;
       }
       return newdata;
     }
     // Fallback case for other 8-bit-per-channel formats.
-    for (int p = 0; p < imgsize; ++p) {
+    for (size_t p = 0; p < imgsize; ++p) {
       for (size_t i = 0; i < format.size(); ++i) {
         if (format[i] == 'B' || (cdata->_num_components <= 2 && format[i] != 'A')) {
           *dst++ = src[0];
@@ -7652,7 +7699,7 @@ get_ram_image_as(const string &requested_format) {
   }
 
   // The slow and general case.
-  for (int p = 0; p < imgsize; ++p) {
+  for (size_t p = 0; p < imgsize; ++p) {
     for (size_t i = 0; i < format.size(); ++i) {
       int component = 0;
       if (format[i] == 'B' || (cdata->_num_components <= 2 && format[i] != 'A')) {
@@ -9252,20 +9299,11 @@ read_dds_level_bc5(Texture *tex, CData *cdata, const DDSHeader &header, int n, i
  * never be called by user code.
  */
 void Texture::
-clear_prepared(int view, PreparedGraphicsObjects *prepared_objects) {
-  PreparedViews::iterator pvi;
-  pvi = _prepared_views.find(prepared_objects);
-  if (pvi != _prepared_views.end()) {
-    Contexts &contexts = (*pvi).second;
-    Contexts::iterator ci;
-    ci = contexts.find(view);
-    if (ci != contexts.end()) {
-      contexts.erase(ci);
-    }
-
-    if (contexts.empty()) {
-      _prepared_views.erase(pvi);
-    }
+clear_prepared(PreparedGraphicsObjects *prepared_objects) {
+  Contexts::iterator ci;
+  ci = _contexts.find(prepared_objects);
+  if (ci != _contexts.end()) {
+    _contexts.erase(ci);
   }
 }
 
@@ -9274,16 +9312,11 @@ clear_prepared(int view, PreparedGraphicsObjects *prepared_objects) {
  * num_channels.
  */
 void Texture::
-consider_downgrade(PNMImage &pnmimage, int num_channels, const string &name) {
-  if (num_channels != 0 && num_channels < pnmimage.get_num_channels()) {
-    // One special case: we can't reduce from 3 to 2 components, since that
-    // would require adding an alpha channel.
-    if (pnmimage.get_num_channels() == 3 && num_channels == 2) {
-      return;
-    }
-
+consider_downgrade(PNMImage &pnmimage, int num_channels, std::string_view name) {
+  if (num_channels != 0 && num_channels != pnmimage.get_num_channels()) {
     gobj_cat.info()
-      << "Downgrading " << name << " from "
+      << (num_channels < pnmimage.get_num_channels() ? "Down" : "Up")
+      << "grading " << name << " from "
       << pnmimage.get_num_channels() << " components to "
       << num_channels << ".\n";
     pnmimage.set_num_channels(num_channels);
@@ -10184,13 +10217,15 @@ do_write_datagram_header(CData *cdata, BamWriter *manager, Datagram &me, bool &h
         << "Texture file " << cdata->_fullpath
         << " found as " << filename << "\n";
     }
-    if (!has_bam_dir || !alpha_filename.make_relative_to(bam_dir, true)) {
-      alpha_filename.find_on_searchpath(get_model_path());
-    }
-    if (gobj_cat.is_debug()) {
-      gobj_cat.debug()
-        << "Alpha image " << cdata->_alpha_fullpath
-        << " found as " << alpha_filename << "\n";
+    if (!alpha_filename.empty()) {
+      if (!has_bam_dir || !alpha_filename.make_relative_to(bam_dir, true)) {
+        alpha_filename.find_on_searchpath(get_model_path());
+      }
+      if (gobj_cat.is_debug()) {
+        gobj_cat.debug()
+          << "Alpha image " << cdata->_alpha_fullpath
+          << " found as " << alpha_filename << "\n";
+      }
     }
     break;
 
@@ -10437,9 +10472,9 @@ make_this_from_bam(const FactoryParams &params) {
         // If texture filename was given relative to the bam filename, expand
         // it now.
         Filename bam_dir = manager->get_filename().get_dirname();
-        vfs->resolve_filename(filename, bam_dir);
+        vfs->resolve_filename(filename, DSearchPath(bam_dir));
         if (!alpha_filename.empty()) {
-          vfs->resolve_filename(alpha_filename, bam_dir);
+          vfs->resolve_filename(alpha_filename, DSearchPath(bam_dir));
         }
       }
 
@@ -10609,7 +10644,7 @@ do_fillin_body(CData *cdata, DatagramIterator &scan, BamReader *manager) {
 
   if (manager->get_file_minor_ver() >= 45) {
     cdata->_has_clear_color = scan.get_bool();
-    if (cdata->_has_clear_color) {
+    if (cdata->_has_clear_color && manager->expect_remaining_size(scan, 16)) {
       cdata->_clear_color.read_datagram(scan);
     }
   }
@@ -10758,11 +10793,10 @@ CData() {
   _y_size = 1;
   _z_size = 1;
   _num_views = 1;
-
-  // We will override the format in a moment (in the Texture constructor), but
-  // set it to something else first to avoid the check in do_set_format
-  // depending on an uninitialized value.
-  _format = F_rgba;
+  _num_components = 3;
+  _component_width = 1;
+  _format = F_rgb;
+  _component_type = T_unsigned_byte;
 
   // Only used for buffer textures.
   _usage_hint = GeomEnums::UH_unspecified;
@@ -10797,6 +10831,8 @@ CData() {
 Texture::CData::
 CData(const Texture::CData &copy) {
   _num_mipmap_levels_read = 0;
+  _render_to_texture = copy._render_to_texture;
+  _post_load_store_cache = copy._post_load_store_cache;
 
   do_assign(&copy);
 
@@ -10858,6 +10894,8 @@ do_assign(const Texture::CData *copy) {
   _simple_x_size = copy->_simple_x_size;
   _simple_y_size = copy->_simple_y_size;
   _simple_ram_image = copy->_simple_ram_image;
+  _has_clear_color = copy->_has_clear_color;
+  _clear_color = copy->_clear_color;
 }
 
 /**

@@ -37,7 +37,23 @@
 #endif
 #endif
 
+extern "C" EXPCL_PANDA_PNMIMAGETYPES void init_libpnmimagetypes();
+
 using std::string;
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+static void em_do_frame(void *arg) {
+  PandaFramework *fwx = (PandaFramework *)arg;
+  nassertv_always(fwx != NULL);
+
+  if (!fwx->do_frame(Thread::get_current_thread())) {
+    emscripten_cancel_main_loop();
+    framework_cat.info() << "Main loop cancelled.\n";
+  }
+}
+#endif
 
 LoaderOptions PandaFramework::_loader_options;
 
@@ -115,7 +131,6 @@ open_framework() {
 
   // Let's explicitly make a call to the image type library to ensure it gets
   // pulled in by the dynamic linker.
-  extern EXPCL_PANDA_PNMIMAGETYPES void init_libpnmimagetypes();
   init_libpnmimagetypes();
 
   reset_frame_rate();
@@ -188,6 +203,8 @@ close_framework() {
   }
 
   _event_handler.remove_all_hooks();
+
+  _task_mgr.cleanup();
 
   _is_open = false;
   _made_default_pipe = false;
@@ -282,7 +299,7 @@ remove_mouse(const GraphicsOutput *window) {
  * description of the function of the key, for display to the user.
  */
 void PandaFramework::
-define_key(const string &event_name, const string &description,
+define_key(std::string_view event_name, std::string description,
            EventHandler::EventCallbackFunction *function,
            void *data) {
   if (_event_handler.has_hook(event_name)) {
@@ -305,8 +322,8 @@ define_key(const string &event_name, const string &description,
   if (!description.empty()) {
     KeyDefinition keydef;
     keydef._event_name = event_name;
-    keydef._description = description;
-    _key_definitions.push_back(keydef);
+    keydef._description = std::move(description);
+    _key_definitions.push_back(std::move(keydef));
   }
 }
 
@@ -316,7 +333,7 @@ define_key(const string &event_name, const string &description,
  * description of the function of the key, for display to the user.
  */
 void PandaFramework::
-define_key(const string &event_name, const string &description,
+define_key(std::string_view event_name, std::string description,
            EventHandler::EventLambda function) {
   if (_event_handler.has_hook(event_name)) {
     // If there is already a hook for the indicated keyname, we're most likely
@@ -338,8 +355,8 @@ define_key(const string &event_name, const string &description,
   if (!description.empty()) {
     KeyDefinition keydef;
     keydef._event_name = event_name;
-    keydef._description = description;
-    _key_definitions.push_back(keydef);
+    keydef._description = std::move(description);
+    _key_definitions.push_back(std::move(keydef));
   }
 }
 
@@ -792,9 +809,14 @@ do_frame(Thread *current_thread) {
  */
 void PandaFramework::
 main_loop() {
+#ifdef __EMSCRIPTEN__
+  framework_cat.info() << "Starting main loop.\n";
+  emscripten_set_main_loop_arg(&em_do_frame, (void *)this, 0, true);
+#else
   Thread *current_thread = Thread::get_current_thread();
   while (do_frame(current_thread)) {
   }
+#endif
 }
 
 /**

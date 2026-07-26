@@ -19,6 +19,7 @@
 #include "callbackObject.h"
 #include "callbackNode.h"
 #include "pointerTo.h"
+#include "small_vector.h"
 
 /**
  * A special node, the sole purpose of which is to invoke a dispatch operation
@@ -26,7 +27,7 @@
  */
 class EXPCL_PANDA_PGRAPHNODES ComputeNode : public PandaNode {
 PUBLISHED:
-  explicit ComputeNode(const std::string &name);
+  explicit ComputeNode(std::string name);
 
   INLINE void add_dispatch(const LVecBase3i &num_groups);
   INLINE void add_dispatch(int num_groups_x, int num_groups_y, int num_groups_z);
@@ -61,7 +62,7 @@ public:
 
     virtual void do_callback(CallbackData *cbdata);
 
-    typedef pvector<LVecBase3i> Dispatches;
+    typedef small_vector<LVecBase3i> Dispatches;
 
     class EXPCL_PANDA_PGRAPHNODES CData : public CycleData {
     public:

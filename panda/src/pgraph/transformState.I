@@ -37,7 +37,7 @@ compare_to(const TransformState &other) const {
 INLINE size_t TransformState::
 get_hash() const {
   check_hash();
-  return _hash;
+  return _hash.load(std::memory_order_relaxed);
 }
 
 /**
@@ -856,7 +856,7 @@ INLINE void TransformState::
 check_hash() const {
   // This pretends to be a const function, even though it's not, because it
   // only updates a transparent cache value.
-  if (_hash == H_unknown) {
+  if (_hash.load(std::memory_order_relaxed) == H_unknown) {
     calc_hash();
   }
 }
@@ -1048,22 +1048,6 @@ consider_update_pstats(int old_referenced_bits) const {
     update_pstats(old_referenced_bits, new_referenced_bits);
   }
 #endif  // DO_PSTATS
-}
-
-/**
- *
- */
-INLINE TransformState::Composition::
-Composition() {
-}
-
-/**
- *
- */
-INLINE TransformState::Composition::
-Composition(const TransformState::Composition &copy) :
-  _result(copy._result)
-{
 }
 
 /**
